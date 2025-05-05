@@ -5,7 +5,7 @@
   "main": "dist/indexer.js",
   "scripts": {
     "build": "tsc",
-    "start": "npm run build && node dist/indexer.js",
+    "start": "node dist/indexer.js",
     "dev": "tsc -w & nodemon dist/indexer.js",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
