@@ -1,0 +1,28 @@
+steps:
+  # Build the container image
+  - name: 'gcr.io/cloud-builders/docker'
+    args: ['build', '-t', 'gcr.io/$PROJECT_ID/transaction-indexer:$COMMIT_SHA', '.']
+
+  # Push the container image to Container Registry
+  - name: 'gcr.io/cloud-builders/docker'
+    args: ['push', 'gcr.io/$PROJECT_ID/transaction-indexer:$COMMIT_SHA']
+
+  # Deploy container image to Cloud Run
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    entrypoint: gcloud
+    args:
+      - 'run'
+      - 'deploy'
+      - 'transaction-indexer'
+      - '--image'
+      - 'gcr.io/$PROJECT_ID/transaction-indexer:$COMMIT_SHA'
+      - '--region'
+      - 'us-central1'
+      - '--platform'
+      - 'managed'
+      - '--allow-unauthenticated'
+      - '--set-env-vars'
+      - 'DATABASE_URL=${_DATABASE_URL},LOG_LEVEL=info,START_BLOCK=0,POLL_INTERVAL_MS=1000,CLEAR_DATA_ON_START=false,STATUS_SERVER_PORT=3000'
+
+images:
+  - 'gcr.io/$PROJECT_ID/transaction-indexer:$COMMIT_SHA' 
