@@ -226,7 +226,7 @@ async function mainLoop(): Promise<void> {
                 await delay(config.pollIntervalMs);
             } else if (!shuttingDown) {
                  // If we processed something, check again immediately (or with minimal delay)
-                 await delay(50); // Small delay to prevent CPU spinning if chain is very active
+                 await delay(config.pollIntervalMs); // Small delay to prevent CPU spinning if chain is very active
              }
 
         } catch (error: any) {
