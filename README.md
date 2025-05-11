@@ -186,6 +186,28 @@ Response:
 }
 ```
 
+### Top Accounts (All-Time)
+
+Get the top accounts by net value for all time (no time filter).
+
+```http
+GET /accounts/top-alltime?limit=20
+```
+
+Response:
+```json
+{
+  "topAccounts": [
+    {
+      "address": "0x123...",
+      "netValue": "1000000000000000000"
+    },
+    // ... more accounts
+  ]
+}
+```
+- `limit` (optional): Number of top accounts to return (default: 10)
+
 ### Block Metrics
 
 Get block production statistics for a time range.

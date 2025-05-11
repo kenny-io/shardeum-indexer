@@ -607,6 +607,64 @@ function startStatusServer(port: number): http.Server {
         }
     });
 
+    // New endpoint for top accounts by value held (all-time, no time filter)
+    /**
+     * @api {get} /accounts/top-alltime Get top accounts by all-time net SHM value
+     * @apiQuery {number} [limit=10] Number of top accounts to return
+     * @apiSuccess {Object[]} topAccounts List of top accounts with address and netValue
+     * @apiSuccessExample {json} Success-Response:
+     *   {
+     *     "topAccounts": [
+     *       { "address": "0x...", "netValue": "123456789" },
+     *       ...
+     *     ]
+     *   }
+     */
+    app.get('/accounts/top-alltime', async (req, res) => {
+        const limit = parseInt(req.query.limit as string || '10', 10);
+        try {
+            const query = `
+                WITH address_balances AS (
+                    SELECT 
+                        address,
+                        SUM(
+                            CASE 
+                                WHEN address = from_address THEN -value::numeric
+                                WHEN address = to_address THEN value::numeric
+                                ELSE 0
+                            END
+                        ) as net_value
+                    FROM (
+                        SELECT from_address as address, value, block_number
+                        FROM transactions
+                        UNION ALL
+                        SELECT to_address as address, value, block_number
+                        FROM transactions
+                        WHERE to_address IS NOT NULL
+                    ) t
+                    GROUP BY address
+                )
+                SELECT 
+                    address,
+                    net_value
+                FROM address_balances
+                WHERE net_value > 0 AND address IS NOT NULL
+                ORDER BY net_value DESC
+                LIMIT $1;
+            `;
+            const result = await pool.query(query, [limit]);
+            res.json({
+                topAccounts: result.rows.map(row => ({
+                    address: row.address,
+                    netValue: row.net_value.toString()
+                }))
+            });
+        } catch (error) {
+            logger.error({ err: error, params: { limit } }, color.red('Error querying top accounts all-time (SQL/database error)'));
+            res.status(500).json({ error: 'Internal server error' });
+        }
+    });
+
     // Endpoint to get transactions for a specific address from DB
     app.get('/addresses/:address/transactions', async (req, res) => {
         const address = req.params.address.toLowerCase(); // Normalize address
