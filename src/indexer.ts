@@ -581,37 +581,23 @@ function startStatusServer(port: number): http.Server {
         try {
             const query = `
                 WITH address_balances AS (
-                    SELECT 
-                        address,
-                        SUM(
-                            CASE 
-                                WHEN address = from_address THEN -value::numeric
-                                WHEN address = to_address THEN value::numeric
-                                ELSE 0
-                            END
-                        ) as net_value
+                    SELECT address, SUM(value) AS net_value
                     FROM (
-                        SELECT from_address as address, value, block_number
-                        FROM transactions
+                        SELECT from_address AS address, -value::numeric AS value FROM transactions
+                        WHERE block_number IN (SELECT block_number FROM blocks WHERE timestamp >= EXTRACT(EPOCH FROM (NOW() - INTERVAL '${interval}')))
                         UNION ALL
-                        SELECT to_address as address, value, block_number
-                        FROM transactions
-                        WHERE to_address IS NOT NULL
+                        SELECT to_address AS address, value::numeric AS value FROM transactions
+                        WHERE to_address IS NOT NULL AND block_number IN (SELECT block_number FROM blocks WHERE timestamp >= EXTRACT(EPOCH FROM (NOW() - INTERVAL '${interval}')))
                     ) t
-                    JOIN blocks b ON t.block_number = b.block_number
-                    WHERE b.timestamp >= EXTRACT(EPOCH FROM (NOW() - INTERVAL '${interval}'))
                     GROUP BY address
                 )
-                SELECT 
-                    address,
-                    net_value
+                SELECT address, net_value
                 FROM address_balances
                 WHERE net_value > 0 AND address IS NOT NULL
                 ORDER BY net_value DESC
                 LIMIT $1;
             `;
             const result = await pool.query(query, [limit]);
-            
             res.json({
                 range,
                 interval,
@@ -644,28 +630,15 @@ function startStatusServer(port: number): http.Server {
         try {
             const query = `
                 WITH address_balances AS (
-                    SELECT 
-                        address,
-                        SUM(
-                            CASE 
-                                WHEN address = from_address THEN -value::numeric
-                                WHEN address = to_address THEN value::numeric
-                                ELSE 0
-                            END
-                        ) as net_value
+                    SELECT address, SUM(value) AS net_value
                     FROM (
-                        SELECT from_address as address, value, block_number
-                        FROM transactions
+                        SELECT from_address AS address, -value::numeric AS value FROM transactions
                         UNION ALL
-                        SELECT to_address as address, value, block_number
-                        FROM transactions
-                        WHERE to_address IS NOT NULL
+                        SELECT to_address AS address, value::numeric AS value FROM transactions WHERE to_address IS NOT NULL
                     ) t
                     GROUP BY address
                 )
-                SELECT 
-                    address,
-                    net_value
+                SELECT address, net_value
                 FROM address_balances
                 WHERE net_value > 0 AND address IS NOT NULL
                 ORDER BY net_value DESC
