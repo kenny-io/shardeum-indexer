@@ -1,4 +1,4 @@
-# Ethereum Transaction Indexer
+# Shardeum Transaction Indexer
 
 A robust Ethereum transaction indexer that processes and stores blockchain data, providing a rich set of APIs for querying historical metrics and transaction data.
 
@@ -185,6 +185,28 @@ Response:
   ]
 }
 ```
+
+### Top Accounts (All-Time)
+
+Get the top accounts by net value for all time (no time filter).
+
+```http
+GET /accounts/top-alltime?limit=20
+```
+
+Response:
+```json
+{
+  "topAccounts": [
+    {
+      "address": "0x123...",
+      "netValue": "1000000000000000000"
+    },
+    // ... more accounts
+  ]
+}
+```
+- `limit` (optional): Number of top accounts to return (default: 10)
 
 ### Block Metrics
 

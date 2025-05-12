@@ -376,6 +376,12 @@ function startStatusServer(port: number): http.Server {
             const result = await pool.query(query);
             const metrics = result.rows[0];
 
+            // Query the actual available data range in the DB
+            const minMaxQuery = 'SELECT MIN(timestamp) AS earliest, MAX(timestamp) AS latest FROM blocks';
+            const minMaxResult = await pool.query(minMaxQuery);
+            const earliest = minMaxResult.rows[0]?.earliest || null;
+            const latest = minMaxResult.rows[0]?.latest || null;
+
             res.json({
                 range,
                 interval,
@@ -386,7 +392,8 @@ function startStatusServer(port: number): http.Server {
                 timeRange: {
                     start: parseInt(metrics.first_block_time || '0', 10),
                     end: parseInt(metrics.last_block_time || '0', 10)
-                }
+                },
+                availableDataRange: { earliest, latest }
             });
         } catch (error) {
             logger.error({ err: error, query: req.query }, color.red('Error querying block metrics'));
@@ -431,7 +438,6 @@ function startStatusServer(port: number): http.Server {
         }
 
         try {
-            // Embed interval directly into the query string
             const query = `
                 SELECT COUNT(t.*) AS transaction_count
                 FROM transactions t
@@ -441,7 +447,13 @@ function startStatusServer(port: number): http.Server {
             const result = await pool.query(query); // No parameters needed now
             const count = result.rows[0]?.transaction_count || 0;
 
-            res.json({ range: range, interval: interval, count: parseInt(count, 10) });
+            // Query the actual available data range in the DB
+            const minMaxQuery = 'SELECT MIN(timestamp) AS earliest, MAX(timestamp) AS latest FROM blocks';
+            const minMaxResult = await pool.query(minMaxQuery);
+            const earliest = minMaxResult.rows[0]?.earliest || null;
+            const latest = minMaxResult.rows[0]?.latest || null;
+
+            res.json({ range: range, interval: interval, count: parseInt(count, 10), availableDataRange: { earliest, latest } });
         } catch (error) {
             logger.error({ err: error, query: req.query }, color.red('Error querying transaction count'));
             res.status(500).json({ error: 'Internal server error' });
@@ -511,10 +523,17 @@ function startStatusServer(port: number): http.Server {
                 }
             }
 
+            // Query the actual available data range in the DB
+            const minMaxQuery = 'SELECT MIN(timestamp) AS earliest, MAX(timestamp) AS latest FROM blocks';
+            const minMaxResult = await pool.query(minMaxQuery);
+            const earliest = minMaxResult.rows[0]?.earliest || null;
+            const latest = minMaxResult.rows[0]?.latest || null;
+
             res.json({
                 range,
                 interval,
-                distribution
+                distribution,
+                availableDataRange: { earliest, latest }
             });
         } catch (error) {
             logger.error({ err: error, query: req.query }, color.red('Error querying transaction type distribution'));
@@ -562,37 +581,23 @@ function startStatusServer(port: number): http.Server {
         try {
             const query = `
                 WITH address_balances AS (
-                    SELECT 
-                        address,
-                        SUM(
-                            CASE 
-                                WHEN address = from_address THEN -value::numeric
-                                WHEN address = to_address THEN value::numeric
-                                ELSE 0
-                            END
-                        ) as net_value
+                    SELECT address, SUM(value) AS net_value
                     FROM (
-                        SELECT from_address as address, value, block_number
-                        FROM transactions
+                        SELECT from_address AS address, -value::numeric AS value FROM transactions
+                        WHERE block_number IN (SELECT block_number FROM blocks WHERE timestamp >= EXTRACT(EPOCH FROM (NOW() - INTERVAL '${interval}')))
                         UNION ALL
-                        SELECT to_address as address, value, block_number
-                        FROM transactions
-                        WHERE to_address IS NOT NULL
+                        SELECT to_address AS address, value::numeric AS value FROM transactions
+                        WHERE to_address IS NOT NULL AND block_number IN (SELECT block_number FROM blocks WHERE timestamp >= EXTRACT(EPOCH FROM (NOW() - INTERVAL '${interval}')))
                     ) t
-                    JOIN blocks b ON t.block_number = b.block_number
-                    WHERE b.timestamp >= EXTRACT(EPOCH FROM (NOW() - INTERVAL '${interval}'))
                     GROUP BY address
                 )
-                SELECT 
-                    address,
-                    net_value
+                SELECT address, net_value
                 FROM address_balances
                 WHERE net_value > 0 AND address IS NOT NULL
                 ORDER BY net_value DESC
                 LIMIT $1;
             `;
             const result = await pool.query(query, [limit]);
-            
             res.json({
                 range,
                 interval,
@@ -603,6 +608,51 @@ function startStatusServer(port: number): http.Server {
             });
         } catch (error) {
             logger.error({ err: error, params: { range, limit } }, color.red('Error querying top accounts (SQL/database error)'));
+            res.status(500).json({ error: 'Internal server error' });
+        }
+    });
+
+    // New endpoint for top accounts by value held (all-time, no time filter)
+    /**
+     * @api {get} /accounts/top-alltime Get top accounts by all-time net SHM value
+     * @apiQuery {number} [limit=10] Number of top accounts to return
+     * @apiSuccess {Object[]} topAccounts List of top accounts with address and netValue
+     * @apiSuccessExample {json} Success-Response:
+     *   {
+     *     "topAccounts": [
+     *       { "address": "0x...", "netValue": "123456789" },
+     *       ...
+     *     ]
+     *   }
+     */
+    app.get('/accounts/top-alltime', async (req, res) => {
+        const limit = parseInt(req.query.limit as string || '10', 10);
+        try {
+            const query = `
+                WITH address_balances AS (
+                    SELECT address, SUM(value) AS net_value
+                    FROM (
+                        SELECT from_address AS address, -value::numeric AS value FROM transactions
+                        UNION ALL
+                        SELECT to_address AS address, value::numeric AS value FROM transactions WHERE to_address IS NOT NULL
+                    ) t
+                    GROUP BY address
+                )
+                SELECT address, net_value
+                FROM address_balances
+                WHERE net_value > 0 AND address IS NOT NULL
+                ORDER BY net_value DESC
+                LIMIT $1;
+            `;
+            const result = await pool.query(query, [limit]);
+            res.json({
+                topAccounts: result.rows.map(row => ({
+                    address: row.address,
+                    netValue: row.net_value.toString()
+                }))
+            });
+        } catch (error) {
+            logger.error({ err: error, params: { limit } }, color.red('Error querying top accounts all-time (SQL/database error)'));
             res.status(500).json({ error: 'Internal server error' });
         }
     });
@@ -634,12 +684,25 @@ function startStatusServer(port: number): http.Server {
         try {
             const { startTime, endTime } = parseTimeRange(range); // Use internal helper
             const stats = await getStatsByTimeRangeDB(startTime, endTime);
-            res.json({ range, startTime, endTime, ...stats });
+
+            // Query the actual available data range in the DB
+            const minMaxQuery = 'SELECT MIN(timestamp) AS earliest, MAX(timestamp) AS latest FROM blocks';
+            const minMaxResult = await pool.query(minMaxQuery);
+            const earliest = minMaxResult.rows[0]?.earliest || null;
+            const latest = minMaxResult.rows[0]?.latest || null;
+
+            res.json({
+                range,
+                startTime,
+                endTime,
+                totalTransactions: stats.transactionCount || 0,
+                totalValue: stats.totalValueWei || '0',
+                availableDataRange: { earliest, latest }
+            });
         } catch (error: any) {
             logger.error({ err: error, range }, color.red('Error parsing time range or fetching stats'));
-            // Distinguish between bad range format and DB error
             if (error.message.includes('Invalid range format')) {
-                 res.status(400).json({ error: error.message });
+                res.status(400).json({ error: error.message });
             } else {
                 res.status(500).json({ error: 'Internal server error fetching statistics' });
             }
@@ -656,11 +719,22 @@ function startStatusServer(port: number): http.Server {
         try {
             const { startTime, endTime } = parseTimeRange(range);
             const count = await getTotalUniqueAccountsDB(startTime, endTime);
+
+            // Query the actual available data range in the DB
+            const minMaxQuery = 'SELECT MIN(timestamp) AS earliest, MAX(timestamp) AS latest FROM blocks';
+            const minMaxResult = await pool.query(minMaxQuery);
+            const earliest = minMaxResult.rows[0]?.earliest || null;
+            const latest = minMaxResult.rows[0]?.latest || null;
+
             res.json({ 
                 range,
                 startTime,
                 endTime,
-                uniqueAccountCount: count 
+                uniqueAccountCount: count || 0,
+                availableDataRange: {
+                    earliest,
+                    latest
+                }
             });
         } catch (error: any) {
             logger.error({ err: error, range }, color.red('Error fetching unique account count'));
@@ -690,7 +764,6 @@ function startStatusServer(port: number): http.Server {
         }
 
         try {
-            // Embed interval directly into the query string
             const query = `
                 SELECT SUM(t.value) AS total_value
                 FROM transactions t
@@ -698,10 +771,15 @@ function startStatusServer(port: number): http.Server {
                 WHERE b.timestamp >= EXTRACT(EPOCH FROM (NOW() - INTERVAL '${interval}'));
             `;
             const result = await pool.query(query); // No parameters needed now
-            // SUM returns NULL if no rows match, default to '0'. Value is NUMERIC, return as string.
             const totalValue = result.rows[0]?.total_value || '0';
 
-            res.json({ range: range, interval: interval, totalValue: totalValue });
+            // Query the actual available data range in the DB
+            const minMaxQuery = 'SELECT MIN(timestamp) AS earliest, MAX(timestamp) AS latest FROM blocks';
+            const minMaxResult = await pool.query(minMaxQuery);
+            const earliest = minMaxResult.rows[0]?.earliest || null;
+            const latest = minMaxResult.rows[0]?.latest || null;
+
+            res.json({ range: range, interval: interval, totalValue: totalValue, availableDataRange: { earliest, latest } });
         } catch (error) {
             logger.error({ err: error, query: req.query }, color.red('Error querying total value'));
             res.status(500).json({ error: 'Internal server error' });
@@ -736,12 +814,19 @@ function startStatusServer(port: number): http.Server {
             const result = await pool.query(query);
             const stats = result.rows[0];
 
+            // Query the actual available data range in the DB
+            const minMaxQuery = 'SELECT MIN(timestamp) AS earliest, MAX(timestamp) AS latest FROM blocks';
+            const minMaxResult = await pool.query(minMaxQuery);
+            const earliest = minMaxResult.rows[0]?.earliest || null;
+            const latest = minMaxResult.rows[0]?.latest || null;
+
             res.json({
                 range,
                 interval,
                 totalGasUsed: parseInt(stats.total_gas_used || '0', 10),
                 averageGasPerBlock: parseFloat(stats.avg_gas_per_block || '0'),
-                totalBlocks: parseInt(stats.total_blocks || '0', 10)
+                totalBlocks: parseInt(stats.total_blocks || '0', 10),
+                availableDataRange: { earliest, latest }
             });
         } catch (error) {
             logger.error({ err: error, query: req.query }, color.red('Error querying gas statistics'));
