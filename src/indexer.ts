@@ -334,25 +334,27 @@ function startStatusServer(port: number): http.Server {
         }
     });
 
+    // Helper to map range to interval or null for 'all'
+    function getIntervalFromRange(range: string): string | null {
+        switch (range) {
+            case '1h': return '1 hour';
+            case '1d': return '1 day';
+            case '7d': return '7 days';
+            case '1m': return '1 month';
+            case 'all': return null;
+            default: return null;
+        }
+    }
 
-    // New endpoint for block production metrics
+    // /blocks/metrics
     app.get('/blocks/metrics', async (req, res) => {
         const range = req.query.range as string;
-        let interval: string;
-
-        // Basic validation and mapping
-        switch (range) {
-            case '1h': interval = '1 hour'; break;
-            case '6h': interval = '6 hours'; break;
-            case '1d': interval = '1 day'; break;
-            case '7d': interval = '7 days'; break;
-            case '30d': interval = '30 days'; break;
-            default:
-                return res.status(400).json({ error: 'Invalid range parameter. Use 1h, 6h, 1d, 7d, or 30d.' });
+        const interval = getIntervalFromRange(range);
+        if (!['1h', '1d', '7d', '1m', 'all'].includes(range)) {
+            return res.status(400).json({ error: 'Invalid range parameter. Use 1h, 1d, 7d, 1m, or all.' });
         }
-
         try {
-            // Use a subquery to compute block_time, then aggregate in the outer query
+            const whereClause = interval ? `WHERE timestamp >= EXTRACT(EPOCH FROM (NOW() - INTERVAL '${interval}'))` : '';
             const query = `
                 SELECT
                   COUNT(*) as total_blocks,
@@ -369,22 +371,19 @@ function startStatusServer(port: number): http.Server {
                     timestamp,
                     timestamp - LAG(timestamp) OVER (ORDER BY block_number) as block_time
                   FROM blocks
-                  WHERE timestamp >= EXTRACT(EPOCH FROM (NOW() - INTERVAL '${interval}'))
+                  ${whereClause}
                 ) sub
                 WHERE block_time IS NOT NULL;
             `;
             const result = await pool.query(query);
             const metrics = result.rows[0];
-
-            // Query the actual available data range in the DB
             const minMaxQuery = 'SELECT MIN(timestamp) AS earliest, MAX(timestamp) AS latest FROM blocks';
             const minMaxResult = await pool.query(minMaxQuery);
             const earliest = minMaxResult.rows[0]?.earliest || null;
             const latest = minMaxResult.rows[0]?.latest || null;
-
             res.json({
                 range,
-                interval,
+                interval: interval || 'all',
                 totalBlocks: parseInt(metrics.total_blocks || '0', 10),
                 uniqueMiners: parseInt(metrics.unique_miners || '0', 10),
                 averageTransactionsPerBlock: parseFloat(metrics.avg_tx_per_block || '0'),
@@ -401,105 +400,61 @@ function startStatusServer(port: number): http.Server {
         }
     });
 
-    // Endpoint to get details for a specific block from DB
-    app.get('/blocks/:blockNumber', async (req, res) => {
-        const blockNumberStr = req.params.blockNumber;
-        const blockNumber = parseInt(blockNumberStr, 10);
-        if (isNaN(blockNumber)) {
-            return res.status(400).json({ error: 'Invalid block number format' });
-        }
-        try {
-            const block = await getBlockByNumberDB(blockNumber);
-            if (block) {
-                res.json(block);
-            } else {
-                res.status(404).json({ error: `Block ${blockNumber} not found in indexer database` });
-            }
-        } catch (error) {
-            logger.error({ err: error, blockNumber }, color.red('Error fetching block from DB'));
-            res.status(500).json({ error: 'Internal server error fetching block' });
-        }
-    });
-
-    // New endpoint for transaction count by time range
+    // /transactions/count
     app.get('/transactions/count', async (req, res) => {
         const range = req.query.range as string;
-        let interval: string;
-
-        // Basic validation and mapping
-        switch (range) {
-            case '1h': interval = '1 hour'; break;
-            case '6h': interval = '6 hours'; break;
-            case '1d': interval = '1 day'; break;
-            case '7d': interval = '7 days'; break;
-            case '30d': interval = '30 days'; break;
-            default:
-                return res.status(400).json({ error: 'Invalid range parameter. Use 1h, 6h, 1d, 7d, or 30d.' });
+        const interval = getIntervalFromRange(range);
+        if (!['1h', '1d', '7d', '1m', 'all'].includes(range)) {
+            return res.status(400).json({ error: 'Invalid range parameter. Use 1h, 1d, 7d, 1m, or all.' });
         }
-
         try {
+            const whereClause = interval ? `WHERE b.timestamp >= EXTRACT(EPOCH FROM (NOW() - INTERVAL '${interval}'))` : '';
             const query = `
                 SELECT COUNT(t.*) AS transaction_count
                 FROM transactions t
                 JOIN blocks b ON t.block_number = b.block_number
-                WHERE b.timestamp >= EXTRACT(EPOCH FROM (NOW() - INTERVAL '${interval}'));
+                ${whereClause};
             `;
-            const result = await pool.query(query); // No parameters needed now
+            const result = await pool.query(query);
             const count = result.rows[0]?.transaction_count || 0;
-
-            // Query the actual available data range in the DB
             const minMaxQuery = 'SELECT MIN(timestamp) AS earliest, MAX(timestamp) AS latest FROM blocks';
             const minMaxResult = await pool.query(minMaxQuery);
             const earliest = minMaxResult.rows[0]?.earliest || null;
             const latest = minMaxResult.rows[0]?.latest || null;
-
-            res.json({ range: range, interval: interval, count: parseInt(count, 10), availableDataRange: { earliest, latest } });
+            res.json({ range, interval: interval || 'all', count: parseInt(count, 10), availableDataRange: { earliest, latest } });
         } catch (error) {
             logger.error({ err: error, query: req.query }, color.red('Error querying transaction count'));
             res.status(500).json({ error: 'Internal server error' });
         }
     });
 
-    // Enhanced endpoint for transaction type distribution with contract interaction decoding
+    // /transactions/types
     app.get('/transactions/types', async (req, res) => {
         const range = req.query.range as string;
-        let interval: string;
-
-        // Basic validation and mapping
-        switch (range) {
-            case '1h': interval = '1 hour'; break;
-            case '6h': interval = '6 hours'; break;
-            case '1d': interval = '1 day'; break;
-            case '7d': interval = '7 days'; break;
-            case '30d': interval = '30 days'; break;
-            default:
-                return res.status(400).json({ error: 'Invalid range parameter. Use 1h, 6h, 1d, 7d, or 30d.' });
+        const interval = getIntervalFromRange(range);
+        if (!['1h', '1d', '7d', '1m', 'all'].includes(range)) {
+            return res.status(400).json({ error: 'Invalid range parameter. Use 1h, 1d, 7d, 1m, or all.' });
         }
-
         try {
-            // Fetch all transactions in the range
+            const whereClause = interval ? `WHERE b.timestamp >= EXTRACT(EPOCH FROM (NOW() - INTERVAL '${interval}'))` : '';
             const query = `
                 SELECT t.input_data
                 FROM transactions t
                 JOIN blocks b ON t.block_number = b.block_number
-                WHERE b.timestamp >= EXTRACT(EPOCH FROM (NOW() - INTERVAL '${interval}'));
+                ${whereClause};
             `;
             const result = await pool.query(query);
             const distribution: Record<string, number> = {};
-
             for (const row of result.rows) {
                 const input = row.input_data;
                 if (input === '0x') {
                     distribution['transfer'] = (distribution['transfer'] || 0) + 1;
                 } else {
-                    // Try to decode as UTF-8 and parse as JSON
                     let decoded = '';
                     try {
-                        // Remove 0x and decode hex to buffer
                         const hex = input.startsWith('0x') ? input.slice(2) : input;
                         const buf = Buffer.from(hex, 'hex');
                         decoded = buf.toString('utf8');
-                        // Try to parse as JSON
                         let parsed;
                         try {
                             parsed = JSON.parse(decoded);
@@ -522,16 +477,13 @@ function startStatusServer(port: number): http.Server {
                     }
                 }
             }
-
-            // Query the actual available data range in the DB
             const minMaxQuery = 'SELECT MIN(timestamp) AS earliest, MAX(timestamp) AS latest FROM blocks';
             const minMaxResult = await pool.query(minMaxQuery);
             const earliest = minMaxResult.rows[0]?.earliest || null;
             const latest = minMaxResult.rows[0]?.latest || null;
-
             res.json({
                 range,
-                interval,
+                interval: interval || 'all',
                 distribution,
                 availableDataRange: { earliest, latest }
             });
@@ -561,46 +513,57 @@ function startStatusServer(port: number): http.Server {
         }
     });
 
-    // New endpoint for top accounts by value held (add detailed error logging)
+    // /accounts/top
     app.get('/accounts/top', async (req, res) => {
         const range = req.query.range as string;
         const limit = parseInt(req.query.limit as string || '10', 10);
-        let interval: string;
-
-        // Basic validation and mapping
-        switch (range) {
-            case '1h': interval = '1 hour'; break;
-            case '6h': interval = '6 hours'; break;
-            case '1d': interval = '1 day'; break;
-            case '7d': interval = '7 days'; break;
-            case '30d': interval = '30 days'; break;
-            default:
-                return res.status(400).json({ error: 'Invalid range parameter. Use 1h, 6h, 1d, 7d, or 30d.' });
+        const interval = getIntervalFromRange(range);
+        if (!['1h', '1d', '7d', '1m', 'all'].includes(range)) {
+            return res.status(400).json({ error: 'Invalid range parameter. Use 1h, 1d, 7d, 1m, or all.' });
         }
-
         try {
-            const query = `
-                WITH address_balances AS (
-                    SELECT address, SUM(value) AS net_value
-                    FROM (
-                        SELECT from_address AS address, -value::numeric AS value FROM transactions
-                        WHERE block_number IN (SELECT block_number FROM blocks WHERE timestamp >= EXTRACT(EPOCH FROM (NOW() - INTERVAL '${interval}')))
-                        UNION ALL
-                        SELECT to_address AS address, value::numeric AS value FROM transactions
-                        WHERE to_address IS NOT NULL AND block_number IN (SELECT block_number FROM blocks WHERE timestamp >= EXTRACT(EPOCH FROM (NOW() - INTERVAL '${interval}')))
-                    ) t
-                    GROUP BY address
-                )
-                SELECT address, net_value
-                FROM address_balances
-                WHERE net_value > 0 AND address IS NOT NULL
-                ORDER BY net_value DESC
-                LIMIT $1;
-            `;
+            let query;
+            if (interval) {
+                query = `
+                    WITH address_balances AS (
+                        SELECT address, SUM(value) AS net_value
+                        FROM (
+                            SELECT from_address AS address, -value::numeric AS value FROM transactions
+                            WHERE block_number IN (SELECT block_number FROM blocks WHERE timestamp >= EXTRACT(EPOCH FROM (NOW() - INTERVAL '${interval}')))
+                            UNION ALL
+                            SELECT to_address AS address, value::numeric AS value FROM transactions
+                            WHERE to_address IS NOT NULL AND block_number IN (SELECT block_number FROM blocks WHERE timestamp >= EXTRACT(EPOCH FROM (NOW() - INTERVAL '${interval}')))
+                        ) t
+                        GROUP BY address
+                    )
+                    SELECT address, net_value
+                    FROM address_balances
+                    WHERE net_value > 0 AND address IS NOT NULL
+                    ORDER BY net_value DESC
+                    LIMIT $1;
+                `;
+            } else {
+                query = `
+                    WITH address_balances AS (
+                        SELECT address, SUM(value) AS net_value
+                        FROM (
+                            SELECT from_address AS address, -value::numeric AS value FROM transactions
+                            UNION ALL
+                            SELECT to_address AS address, value::numeric AS value FROM transactions WHERE to_address IS NOT NULL
+                        ) t
+                        GROUP BY address
+                    )
+                    SELECT address, net_value
+                    FROM address_balances
+                    WHERE net_value > 0 AND address IS NOT NULL
+                    ORDER BY net_value DESC
+                    LIMIT $1;
+                `;
+            }
             const result = await pool.query(query, [limit]);
             res.json({
                 range,
-                interval,
+                interval: interval || 'all',
                 topAccounts: result.rows.map(row => ({
                     address: row.address,
                     netValue: row.net_value.toString()
@@ -674,23 +637,31 @@ function startStatusServer(port: number): http.Server {
         }
     });
 
-    // Endpoint for time-range statistics
+    // /stats
     app.get('/stats', async (req, res) => {
         const range = req.query.range as string | undefined;
-        if (!range) {
-            return res.status(400).json({ error: 'Missing required query parameter: range (e.g., 24h, 7d, 30d)' });
+        const interval = getIntervalFromRange(range || 'all');
+        if (!range || !['1h', '1d', '7d', '1m', 'all'].includes(range)) {
+            return res.status(400).json({ error: 'Missing or invalid required query parameter: range (1h, 1d, 7d, 1m, all)' });
         }
-
         try {
-            const { startTime, endTime } = parseTimeRange(range); // Use internal helper
+            let startTime = 0;
+            let endTime = Math.floor(Date.now() / 1000);
+            if (interval) {
+                // Calculate startTime based on interval
+                const now = Math.floor(Date.now() / 1000);
+                switch (range) {
+                    case '1h': startTime = now - 60 * 60; break;
+                    case '1d': startTime = now - 24 * 60 * 60; break;
+                    case '7d': startTime = now - 7 * 24 * 60 * 60; break;
+                    case '1m': startTime = now - 30 * 24 * 60 * 60; break;
+                }
+            }
             const stats = await getStatsByTimeRangeDB(startTime, endTime);
-
-            // Query the actual available data range in the DB
             const minMaxQuery = 'SELECT MIN(timestamp) AS earliest, MAX(timestamp) AS latest FROM blocks';
             const minMaxResult = await pool.query(minMaxQuery);
             const earliest = minMaxResult.rows[0]?.earliest || null;
             const latest = minMaxResult.rows[0]?.latest || null;
-
             res.json({
                 range,
                 startTime,
@@ -709,23 +680,30 @@ function startStatusServer(port: number): http.Server {
         }
     });
 
-    // Endpoint for total unique accounts
+    // /stats/accounts/unique-count
     app.get('/stats/accounts/unique-count', async (req, res) => {
         const range = req.query.range as string;
-        if (!range) {
-            return res.status(400).json({ error: 'Missing required query parameter: range (e.g., 1h, 1d, 7d, 30d, 1m, 1y)' });
+        const interval = getIntervalFromRange(range);
+        if (!['1h', '1d', '7d', '1m', 'all'].includes(range)) {
+            return res.status(400).json({ error: 'Invalid range parameter. Use 1h, 1d, 7d, 1m, or all.' });
         }
-
         try {
-            const { startTime, endTime } = parseTimeRange(range);
+            let startTime = 0;
+            let endTime = Math.floor(Date.now() / 1000);
+            if (interval) {
+                const now = Math.floor(Date.now() / 1000);
+                switch (range) {
+                    case '1h': startTime = now - 60 * 60; break;
+                    case '1d': startTime = now - 24 * 60 * 60; break;
+                    case '7d': startTime = now - 7 * 24 * 60 * 60; break;
+                    case '1m': startTime = now - 30 * 24 * 60 * 60; break;
+                }
+            }
             const count = await getTotalUniqueAccountsDB(startTime, endTime);
-
-            // Query the actual available data range in the DB
             const minMaxQuery = 'SELECT MIN(timestamp) AS earliest, MAX(timestamp) AS latest FROM blocks';
             const minMaxResult = await pool.query(minMaxQuery);
             const earliest = minMaxResult.rows[0]?.earliest || null;
             const latest = minMaxResult.rows[0]?.latest || null;
-
             res.json({ 
                 range,
                 startTime,
@@ -738,91 +716,68 @@ function startStatusServer(port: number): http.Server {
             });
         } catch (error: any) {
             logger.error({ err: error, range }, color.red('Error fetching unique account count'));
-            // Distinguish between bad range format and DB error
             if (error.message.includes('Invalid range format')) {
                 res.status(400).json({ error: error.message });
             } else {
                 res.status(500).json({ error: 'Internal server error fetching unique account count' });
             }
         }
-    }); 
+    });
 
-    // New endpoint for total value transferred by time range
+    // /value
     app.get('/value', async (req, res) => {
         const range = req.query.range as string;
-        let interval: string;
-
-        // Basic validation and mapping (same as /transactions)
-        switch (range) {
-            case '1h': interval = '1 hour'; break;
-            case '6h': interval = '6 hours'; break;
-            case '1d': interval = '1 day'; break;
-            case '7d': interval = '7 days'; break;
-            case '30d': interval = '30 days'; break;
-            default:
-                return res.status(400).json({ error: 'Invalid range parameter. Use 1h, 6h, 1d, 7d, or 30d.' });
+        const interval = getIntervalFromRange(range);
+        if (!['1h', '1d', '7d', '1m', 'all'].includes(range)) {
+            return res.status(400).json({ error: 'Invalid range parameter. Use 1h, 1d, 7d, 1m, or all.' });
         }
-
         try {
+            const whereClause = interval ? `WHERE b.timestamp >= EXTRACT(EPOCH FROM (NOW() - INTERVAL '${interval}'))` : '';
             const query = `
                 SELECT SUM(t.value) AS total_value
                 FROM transactions t
                 JOIN blocks b ON t.block_number = b.block_number
-                WHERE b.timestamp >= EXTRACT(EPOCH FROM (NOW() - INTERVAL '${interval}'));
+                ${whereClause};
             `;
-            const result = await pool.query(query); // No parameters needed now
+            const result = await pool.query(query);
             const totalValue = result.rows[0]?.total_value || '0';
-
-            // Query the actual available data range in the DB
             const minMaxQuery = 'SELECT MIN(timestamp) AS earliest, MAX(timestamp) AS latest FROM blocks';
             const minMaxResult = await pool.query(minMaxQuery);
             const earliest = minMaxResult.rows[0]?.earliest || null;
             const latest = minMaxResult.rows[0]?.latest || null;
-
-            res.json({ range: range, interval: interval, totalValue: totalValue, availableDataRange: { earliest, latest } });
+            res.json({ range, interval: interval || 'all', totalValue: totalValue, availableDataRange: { earliest, latest } });
         } catch (error) {
             logger.error({ err: error, query: req.query }, color.red('Error querying total value'));
             res.status(500).json({ error: 'Internal server error' });
         }
     });
 
-    // New endpoint for gas spent by time range
+    // /gas
     app.get('/gas', async (req, res) => {
         const range = req.query.range as string;
-        let interval: string;
-
-        // Basic validation and mapping
-        switch (range) {
-            case '1h': interval = '1 hour'; break;
-            case '6h': interval = '6 hours'; break;
-            case '1d': interval = '1 day'; break;
-            case '7d': interval = '7 days'; break;
-            case '30d': interval = '30 days'; break;
-            default:
-                return res.status(400).json({ error: 'Invalid range parameter. Use 1h, 6h, 1d, 7d, or 30d.' });
+        const interval = getIntervalFromRange(range);
+        if (!['1h', '1d', '7d', '1m', 'all'].includes(range)) {
+            return res.status(400).json({ error: 'Invalid range parameter. Use 1h, 1d, 7d, 1m, or all.' });
         }
-
         try {
+            const whereClause = interval ? `WHERE b.timestamp >= EXTRACT(EPOCH FROM (NOW() - INTERVAL '${interval}'))` : '';
             const query = `
                 SELECT 
                     SUM(b.gas_used) as total_gas_used,
                     AVG(b.gas_used) as avg_gas_per_block,
                     COUNT(DISTINCT b.block_number) as total_blocks
                 FROM blocks b
-                WHERE b.timestamp >= EXTRACT(EPOCH FROM (NOW() - INTERVAL '${interval}'));
+                ${whereClause};
             `;
             const result = await pool.query(query);
             const stats = result.rows[0];
-
-            // Query the actual available data range in the DB
             const minMaxQuery = 'SELECT MIN(timestamp) AS earliest, MAX(timestamp) AS latest FROM blocks';
             const minMaxResult = await pool.query(minMaxQuery);
             const earliest = minMaxResult.rows[0]?.earliest || null;
             const latest = minMaxResult.rows[0]?.latest || null;
-
             res.json({
                 range,
-                interval,
+                interval: interval || 'all',
                 totalGasUsed: parseInt(stats.total_gas_used || '0', 10),
                 averageGasPerBlock: parseFloat(stats.avg_gas_per_block || '0'),
                 totalBlocks: parseInt(stats.total_blocks || '0', 10),

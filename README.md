@@ -41,10 +41,10 @@ BACKWARD_SYNC_BATCH_SIZE=10
 
 All endpoints support the following time ranges:
 - `1h`: Last hour
-- `6h`: Last 6 hours
 - `1d`: Last 24 hours
 - `7d`: Last 7 days
-- `30d`: Last 30 days
+- `1m`: Last 1 month
+- `all`: All available data
 
 ### Indexer Status
 
@@ -89,6 +89,7 @@ Get the number of transactions in a time range.
 
 ```http
 GET /transactions/count?range=1d
+GET /transactions/count?range=all
 ```
 
 Response:
@@ -106,6 +107,7 @@ Get the total value transferred in a time range.
 
 ```http
 GET /value?range=7d
+GET /value?range=all
 ```
 
 Response:
@@ -123,6 +125,7 @@ Get gas usage statistics for a time range.
 
 ```http
 GET /gas?range=1d
+GET /gas?range=all
 ```
 
 Response:
@@ -146,6 +149,7 @@ If the input data is not JSON or does not contain `internalTXType`, it is classi
 
 ```http
 GET /transactions/types?range=7d
+GET /transactions/types?range=all
 ```
 
 Example response:
@@ -168,14 +172,15 @@ Example response:
 Get the top accounts by net value in a time range.
 
 ```http
-GET /accounts/top?range=30d&limit=20
+GET /accounts/top?range=1d&limit=20
+GET /accounts/top?range=all&limit=20
 ```
 
 Response:
 ```json
 {
-  "range": "30d",
-  "interval": "30 days",
+  "range": "1d",
+  "interval": "1 day",
   "topAccounts": [
     {
       "address": "0x123...",
@@ -214,6 +219,7 @@ Get block production statistics for a time range.
 
 ```http
 GET /blocks/metrics?range=1h
+GET /blocks/metrics?range=all
 ```
 
 Response:
@@ -308,6 +314,7 @@ Get comprehensive statistics for a time range.
 
 ```http
 GET /stats?range=24h
+GET /stats?range=all
 ```
 
 Response:
