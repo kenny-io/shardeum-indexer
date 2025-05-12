@@ -1,4 +1,4 @@
-# Ethereum Transaction Indexer
+# Shardeum Transaction Indexer
 
 A robust Ethereum transaction indexer that processes and stores blockchain data, providing a rich set of APIs for querying historical metrics and transaction data.
 
