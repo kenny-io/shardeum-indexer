@@ -248,11 +248,7 @@ function startStatusServer(port: number): http.Server {
     const app = express();
 
     // Configure CORS
-    app.use(cors({
-        origin: ['http://localhost:3000', 'http://localhost:5173'], // Allow our Next.js frontend and Vite dev server
-        methods: ['GET'], // Only allow GET requests
-        allowedHeaders: ['Content-Type'],
-    }));
+    app.use(cors());
 
     // Simple status endpoint
     app.get('/status', async (req, res) => {

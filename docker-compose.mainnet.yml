@@ -8,6 +8,8 @@ services:
     depends_on:
       - db
     restart: unless-stopped
+    volumes:
+      - ./data:/usr/src/app/data   
 
   db:
     image: postgres:15
