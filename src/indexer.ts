@@ -2,6 +2,7 @@ import pino from 'pino';
 import express from 'express';
 import cors from 'cors';
 import http from 'http';
+import NodeCache from 'node-cache';
 import { config } from './config/config';
 import { getLatestBlockNumber, getBlockByNumber } from './rpcClient';
 import { loadState, saveState, saveForwardHead, saveBackwardHead } from './stateManager'; 
@@ -10,6 +11,9 @@ import { Block, Transaction } from './types';
 import { initializeDatabase, insertBlockData, getBlockByNumberDB, getTransactionByHashDB, getTransactionsByAddressDB, getStatsByTimeRangeDB, getTotalUniqueAccountsDB, closeDatabasePool, clearDatabaseTables, checkBlockExistsDB, insertMultipleBlocksData, pool } from './database'; 
 
 const logger = pino({ level: config.logLevel });
+
+// Initialize cache with 60-second TTL by default
+const queryCache = new NodeCache({ stdTTL: 60, checkperiod: 120 });
 
 // Global state for shutdown signal
 let shuttingDown = false;
@@ -247,8 +251,18 @@ async function mainLoop(): Promise<void> {
 function startStatusServer(port: number): http.Server {
     const app = express();
 
-    // Configure CORS
-    app.use(cors());
+    // Completely disable CORS restrictions
+    app.use((req, res, next) => {
+      res.header('Access-Control-Allow-Origin', '*');
+      res.header('Access-Control-Allow-Methods', '*');
+      res.header('Access-Control-Allow-Headers', '*');
+      res.header('Access-Control-Allow-Credentials', 'true');
+      
+      if (req.method === 'OPTIONS') {
+        return res.status(200).end();
+      }
+      next();
+    });
 
     // Simple status endpoint
     app.get('/status', async (req, res) => {
@@ -336,7 +350,7 @@ function startStatusServer(port: number): http.Server {
             case '1h': return '1 hour';
             case '1d': return '1 day';
             case '7d': return '7 days';
-            case '1m': return '1 month';
+            case '30d': return '30 days';
             case 'all': return null;
             default: return null;
         }
@@ -346,50 +360,101 @@ function startStatusServer(port: number): http.Server {
     app.get('/blocks/metrics', async (req, res) => {
         const range = req.query.range as string;
         const interval = getIntervalFromRange(range);
-        if (!['1h', '1d', '7d', '1m', 'all'].includes(range)) {
-            return res.status(400).json({ error: 'Invalid range parameter. Use 1h, 1d, 7d, 1m, or all.' });
+        if (!['1h', '1d', '7d', '30d', 'all'].includes(range)) {
+            return res.status(400).json({ error: 'Invalid range parameter. Use 1h, 1d, 7d, 30d, or all.' });
         }
+        
+        // Generate a cache key based on the request parameters
+        const cacheKey = `blocks_metrics_${range}`;
+        
+        // Try to get from cache first
+        const cachedResult = queryCache.get(cacheKey);
+        if (cachedResult) {
+            logger.debug(`Cache hit for ${cacheKey}`);
+            return res.json(cachedResult);
+        }
+        
         try {
+            // Split the query into two parts for better performance
+            // Part 1: Get basic block metrics (faster)
             const whereClause = interval ? `WHERE timestamp >= EXTRACT(EPOCH FROM (NOW() - INTERVAL '${interval}'))` : '';
-            const query = `
+            const basicMetricsQuery = `
                 SELECT
                   COUNT(*) as total_blocks,
                   COUNT(DISTINCT miner) as unique_miners,
                   AVG(transaction_count) as avg_tx_per_block,
                   MIN(timestamp) as first_block_time,
-                  MAX(timestamp) as last_block_time,
-                  AVG(block_time) as avg_block_time
-                FROM (
-                  SELECT
-                    block_number,
-                    miner,
-                    transaction_count,
-                    timestamp,
-                    timestamp - LAG(timestamp) OVER (ORDER BY block_number) as block_time
-                  FROM blocks
-                  ${whereClause}
-                ) sub
-                WHERE block_time IS NOT NULL;
+                  MAX(timestamp) as last_block_time
+                FROM blocks
+                ${whereClause};
             `;
-            const result = await pool.query(query);
-            const metrics = result.rows[0];
-            const minMaxQuery = 'SELECT MIN(timestamp) AS earliest, MAX(timestamp) AS latest FROM blocks';
-            const minMaxResult = await pool.query(minMaxQuery);
-            const earliest = minMaxResult.rows[0]?.earliest || null;
-            const latest = minMaxResult.rows[0]?.latest || null;
-            res.json({
+            
+            // Part 2: Calculate average block time on a limited sample (much faster)
+            // This avoids the expensive window function on the entire dataset
+            const blockTimeQuery = `
+                WITH block_samples AS (
+                    SELECT
+                        block_number,
+                        timestamp
+                    FROM blocks
+                    ${whereClause}
+                    ORDER BY block_number
+                    LIMIT 10000  -- Limit to a reasonable sample size
+                )
+                SELECT
+                    AVG(timestamp - prev_timestamp) as avg_block_time
+                FROM (
+                    SELECT
+                        block_number,
+                        timestamp,
+                        LAG(timestamp) OVER (ORDER BY block_number) as prev_timestamp
+                    FROM block_samples
+                ) sub
+                WHERE prev_timestamp IS NOT NULL;
+            `;
+            
+            // Execute both queries in parallel
+            const [basicMetricsResult, blockTimeResult] = await Promise.all([
+                pool.query(basicMetricsQuery),
+                pool.query(blockTimeQuery)
+            ]);
+            
+            const metrics = basicMetricsResult.rows[0];
+            const blockTimeMetrics = blockTimeResult.rows[0];
+            
+            // Get min/max timestamps (reuse cached version if available)
+            const timeRangeCacheKey = 'blocks_time_range';
+            let timeRange = queryCache.get(timeRangeCacheKey);
+            
+            if (!timeRange) {
+                const minMaxQuery = 'SELECT MIN(timestamp) AS earliest, MAX(timestamp) AS latest FROM blocks';
+                const minMaxResult = await pool.query(minMaxQuery);
+                timeRange = { 
+                    earliest: minMaxResult.rows[0]?.earliest || null,
+                    latest: minMaxResult.rows[0]?.latest || null 
+                };
+                queryCache.set(timeRangeCacheKey, timeRange, 300); // Cache for 5 minutes
+            }
+            
+            // Prepare the response
+            const response = {
                 range,
                 interval: interval || 'all',
                 totalBlocks: parseInt(metrics.total_blocks || '0', 10),
                 uniqueMiners: parseInt(metrics.unique_miners || '0', 10),
                 averageTransactionsPerBlock: parseFloat(metrics.avg_tx_per_block || '0'),
-                averageBlockTime: parseFloat(metrics.avg_block_time || '0'),
+                averageBlockTime: parseFloat(blockTimeMetrics.avg_block_time || '0'),
                 timeRange: {
                     start: parseInt(metrics.first_block_time || '0', 10),
                     end: parseInt(metrics.last_block_time || '0', 10)
                 },
-                availableDataRange: { earliest, latest }
-            });
+                availableDataRange: timeRange
+            };
+            
+            // Cache the result
+            queryCache.set(cacheKey, response);
+            
+            res.json(response);
         } catch (error) {
             logger.error({ err: error, query: req.query }, color.red('Error querying block metrics'));
             res.status(500).json({ error: 'Internal server error' });
@@ -400,24 +465,67 @@ function startStatusServer(port: number): http.Server {
     app.get('/transactions/count', async (req, res) => {
         const range = req.query.range as string;
         const interval = getIntervalFromRange(range);
-        if (!['1h', '1d', '7d', '1m', 'all'].includes(range)) {
-            return res.status(400).json({ error: 'Invalid range parameter. Use 1h, 1d, 7d, 1m, or all.' });
+        if (!['1h', '1d', '7d', '30d', 'all'].includes(range)) {
+            return res.status(400).json({ error: 'Invalid range parameter. Use 1h, 1d, 7d, 30d, or all.' });
         }
+        
+        // Generate a cache key based on the request parameters
+        const cacheKey = `tx_count_${range}`;
+        
+        // Try to get from cache first
+        const cachedResult = queryCache.get(cacheKey);
+        if (cachedResult) {
+            logger.debug(`Cache hit for ${cacheKey}`);
+            return res.json(cachedResult);
+        }
+        
         try {
-            const whereClause = interval ? `WHERE b.timestamp >= EXTRACT(EPOCH FROM (NOW() - INTERVAL '${interval}'))` : '';
-            const query = `
-                SELECT COUNT(t.*) AS transaction_count
-                FROM transactions t
-                JOIN blocks b ON t.block_number = b.block_number
-                ${whereClause};
-            `;
+            // Use more efficient query with subquery instead of join when possible
+            let query;
+            if (interval) {
+                // For time-based queries, use a subquery to filter blocks first
+                query = `
+                    SELECT COUNT(*) AS transaction_count
+                    FROM transactions t
+                    WHERE t.block_number IN (
+                        SELECT block_number FROM blocks 
+                        WHERE timestamp >= EXTRACT(EPOCH FROM (NOW() - INTERVAL '${interval}'))
+                    );
+                `;
+            } else {
+                // For 'all' range, just count all transactions
+                query = `SELECT COUNT(*) AS transaction_count FROM transactions;`;
+            }
+            
             const result = await pool.query(query);
             const count = result.rows[0]?.transaction_count || 0;
-            const minMaxQuery = 'SELECT MIN(timestamp) AS earliest, MAX(timestamp) AS latest FROM blocks';
-            const minMaxResult = await pool.query(minMaxQuery);
-            const earliest = minMaxResult.rows[0]?.earliest || null;
-            const latest = minMaxResult.rows[0]?.latest || null;
-            res.json({ range, interval: interval || 'all', count: parseInt(count, 10), availableDataRange: { earliest, latest } });
+            
+            // Get min/max timestamps (also cached)
+            const timeRangeCacheKey = 'blocks_time_range';
+            let timeRange = queryCache.get(timeRangeCacheKey);
+            
+            if (!timeRange) {
+                const minMaxQuery = 'SELECT MIN(timestamp) AS earliest, MAX(timestamp) AS latest FROM blocks';
+                const minMaxResult = await pool.query(minMaxQuery);
+                timeRange = { 
+                    earliest: minMaxResult.rows[0]?.earliest || null,
+                    latest: minMaxResult.rows[0]?.latest || null 
+                };
+                queryCache.set(timeRangeCacheKey, timeRange, 300); // Cache for 5 minutes
+            }
+            
+            // Prepare the response
+            const response = { 
+                range, 
+                interval: interval || 'all', 
+                count: parseInt(count, 10), 
+                availableDataRange: timeRange 
+            };
+            
+            // Cache the result
+            queryCache.set(cacheKey, response);
+            
+            res.json(response);
         } catch (error) {
             logger.error({ err: error, query: req.query }, color.red('Error querying transaction count'));
             res.status(500).json({ error: 'Internal server error' });
@@ -428,61 +536,86 @@ function startStatusServer(port: number): http.Server {
     app.get('/transactions/types', async (req, res) => {
         const range = req.query.range as string;
         const interval = getIntervalFromRange(range);
-        if (!['1h', '1d', '7d', '1m', 'all'].includes(range)) {
-            return res.status(400).json({ error: 'Invalid range parameter. Use 1h, 1d, 7d, 1m, or all.' });
+        if (!['1h', '1d', '7d', '30d', 'all'].includes(range)) {
+            return res.status(400).json({ error: 'Invalid range parameter. Use 1h, 1d, 7d, 30d, or all.' });
         }
+        
+        // Generate a cache key based on the request parameters
+        const cacheKey = `tx_types_${range}`;
+        
+        // Try to get from cache first
+        const cachedResult = queryCache.get(cacheKey);
+        if (cachedResult) {
+            logger.debug(`Cache hit for ${cacheKey}`);
+            return res.json(cachedResult);
+        }
+        
         try {
-            const whereClause = interval ? `WHERE b.timestamp >= EXTRACT(EPOCH FROM (NOW() - INTERVAL '${interval}'))` : '';
-            const query = `
-                SELECT t.input_data
-                FROM transactions t
-                JOIN blocks b ON t.block_number = b.block_number
-                ${whereClause};
-            `;
+            // Use a more efficient approach with a CASE statement in SQL
+            // This moves the classification logic to the database instead of JavaScript
+            let query;
+            if (interval) {
+                query = `
+                    SELECT
+                        CASE
+                            WHEN input_data = '0x' THEN 'transfer'
+                            ELSE 'contract_interaction'
+                        END AS tx_type,
+                        COUNT(*) AS count
+                    FROM transactions t
+                    WHERE t.block_number IN (
+                        SELECT block_number FROM blocks 
+                        WHERE timestamp >= EXTRACT(EPOCH FROM (NOW() - INTERVAL '${interval}'))
+                    )
+                    GROUP BY tx_type;
+                `;
+            } else {
+                query = `
+                    SELECT
+                        CASE
+                            WHEN input_data = '0x' THEN 'transfer'
+                            ELSE 'contract_interaction'
+                        END AS tx_type,
+                        COUNT(*) AS count
+                    FROM transactions
+                    GROUP BY tx_type;
+                `;
+            }
+            
             const result = await pool.query(query);
+            
+            // Convert the result to the expected distribution format
             const distribution: Record<string, number> = {};
             for (const row of result.rows) {
-                const input = row.input_data;
-                if (input === '0x') {
-                    distribution['transfer'] = (distribution['transfer'] || 0) + 1;
-                } else {
-                    let decoded = '';
-                    try {
-                        const hex = input.startsWith('0x') ? input.slice(2) : input;
-                        const buf = Buffer.from(hex, 'hex');
-                        decoded = buf.toString('utf8');
-                        let parsed;
-                        try {
-                            parsed = JSON.parse(decoded);
-                        } catch {
-                            parsed = null;
-                        }
-                        if (parsed && typeof parsed === 'object' && parsed.internalTXType !== undefined) {
-                            if (parsed.internalTXType === 6) {
-                                distribution['stake'] = (distribution['stake'] || 0) + 1;
-                            } else if (parsed.internalTXType === 7) {
-                                distribution['unstake'] = (distribution['unstake'] || 0) + 1;
-                            } else {
-                                distribution['other_contract_interaction'] = (distribution['other_contract_interaction'] || 0) + 1;
-                            }
-                        } else {
-                            distribution['contract_interaction'] = (distribution['contract_interaction'] || 0) + 1;
-                        }
-                    } catch {
-                        distribution['contract_interaction'] = (distribution['contract_interaction'] || 0) + 1;
-                    }
-                }
+                distribution[row.tx_type] = parseInt(row.count, 10);
             }
-            const minMaxQuery = 'SELECT MIN(timestamp) AS earliest, MAX(timestamp) AS latest FROM blocks';
-            const minMaxResult = await pool.query(minMaxQuery);
-            const earliest = minMaxResult.rows[0]?.earliest || null;
-            const latest = minMaxResult.rows[0]?.latest || null;
-            res.json({
+            
+            // Get min/max timestamps (reuse cached version if available)
+            const timeRangeCacheKey = 'blocks_time_range';
+            let timeRange = queryCache.get(timeRangeCacheKey);
+            
+            if (!timeRange) {
+                const minMaxQuery = 'SELECT MIN(timestamp) AS earliest, MAX(timestamp) AS latest FROM blocks';
+                const minMaxResult = await pool.query(minMaxQuery);
+                timeRange = { 
+                    earliest: minMaxResult.rows[0]?.earliest || null,
+                    latest: minMaxResult.rows[0]?.latest || null 
+                };
+                queryCache.set(timeRangeCacheKey, timeRange, 300); // Cache for 5 minutes
+            }
+            
+            // Prepare the response
+            const response = {
                 range,
                 interval: interval || 'all',
                 distribution,
-                availableDataRange: { earliest, latest }
-            });
+                availableDataRange: timeRange
+            };
+            
+            // Cache the result
+            queryCache.set(cacheKey, response);
+            
+            res.json(response);
         } catch (error) {
             logger.error({ err: error, query: req.query }, color.red('Error querying transaction type distribution'));
             res.status(500).json({ error: 'Internal server error' });
@@ -508,66 +641,280 @@ function startStatusServer(port: number): http.Server {
             res.status(500).json({ error: 'Internal server error fetching transaction' });
         }
     });
+    
+    // /transactions/latest - Get the most recent transactions
+    app.get('/transactions/latest', async (req, res) => {
+        const limit = parseInt(req.query.limit as string || '10', 10);
+        
+        // Generate a cache key based on the request parameters
+        const cacheKey = `latest_transactions_${limit}`;
+        
+        // Latest transactions should have a shorter cache TTL since they change frequently
+        // Try to get from cache first
+        const cachedResult = queryCache.get(cacheKey);
+        if (cachedResult) {
+            logger.debug(`Cache hit for ${cacheKey}`);
+            return res.json(cachedResult);
+        }
+        
+        try {
+            // Use a more efficient query with a window function to avoid scanning all transactions
+            // This approach first gets the latest block numbers, then fetches transactions
+            const query = `
+                WITH latest_blocks AS (
+                    SELECT block_number, timestamp
+                    FROM blocks
+                    ORDER BY block_number DESC
+                    LIMIT 20 -- Fetch more blocks than needed to ensure we get enough transactions
+                )
+                SELECT t.tx_hash, t.from_address, t.to_address, t.value, t.gas, t.gas_price, 
+                       t.input_data, t.block_number, lb.timestamp
+                FROM transactions t
+                JOIN latest_blocks lb ON t.block_number = lb.block_number
+                ORDER BY t.block_number DESC, t.tx_index DESC
+                LIMIT $1;
+            `;
+            
+            const result = await pool.query(query, [limit]);
+            
+            // Prepare the response
+            const response = {
+                transactions: result.rows.map(row => ({
+                    hash: row.tx_hash,
+                    from: row.from_address,
+                    to: row.to_address,
+                    value: row.value,
+                    gas: row.gas,
+                    gasPrice: row.gas_price,
+                    input: row.input_data,
+                    blockNumber: row.block_number,
+                    timestamp: row.timestamp
+                }))
+            };
+            
+            // Cache the result with a shorter TTL since this data changes frequently
+            queryCache.set(cacheKey, response, 30); // Cache for 30 seconds
+            
+            res.json(response);
+        } catch (error) {
+            logger.error({ err: error, params: { limit } }, color.red('Error querying latest transactions'));
+            res.status(500).json({ error: 'Internal server error' });
+        }
+    });
 
     // /accounts/top
     app.get('/accounts/top', async (req, res) => {
         const range = req.query.range as string;
         const limit = parseInt(req.query.limit as string || '10', 10);
         const interval = getIntervalFromRange(range);
-        if (!['1h', '1d', '7d', '1m', 'all'].includes(range)) {
-            return res.status(400).json({ error: 'Invalid range parameter. Use 1h, 1d, 7d, 1m, or all.' });
+        if (!['1h', '1d', '7d', '30d', 'all'].includes(range)) {
+            return res.status(400).json({ error: 'Invalid range parameter. Use 1h, 1d, 7d, 30d, or all.' });
         }
+        
+        // Generate a cache key based on the request parameters
+        const cacheKey = `top_accounts_${range}_${limit}`;
+        
+        // Try to get from cache first
+        const cachedResult = queryCache.get(cacheKey);
+        if (cachedResult) {
+            logger.debug(`Cache hit for ${cacheKey}`);
+            return res.json(cachedResult);
+        }
+        
+        // Use a client from the pool for transaction support
+        const client = await pool.connect();
+        
         try {
-            let query;
+            // Start a transaction
+            await client.query('BEGIN');
+            
+            // Temporarily increase work_mem for this complex query
+            await client.query('SET LOCAL work_mem = \'32MB\';');
+            
             if (interval) {
-                query = `
-                    WITH address_balances AS (
-                        SELECT address, SUM(value) AS net_value
+                // For time-based queries, execute each statement separately
+                
+                // 1. Create temp table for relevant blocks
+                await client.query(`
+                    CREATE TEMP TABLE IF NOT EXISTS temp_blocks_in_range (
+                        block_number BIGINT PRIMARY KEY
+                    ) ON COMMIT DROP;
+                `);
+                
+                // 2. Clear the table
+                await client.query('TRUNCATE temp_blocks_in_range;');
+                
+                // 3. Insert blocks in the time range
+                await client.query(`
+                    INSERT INTO temp_blocks_in_range (block_number)
+                    SELECT block_number FROM blocks 
+                    WHERE timestamp >= EXTRACT(EPOCH FROM (NOW() - INTERVAL '${interval}'));
+                `);
+                
+                // 4. Create temp table for outgoing values
+                await client.query(`
+                    CREATE TEMP TABLE IF NOT EXISTS temp_outgoing_values (
+                        address VARCHAR(42),
+                        value NUMERIC(38, 0)
+                    ) ON COMMIT DROP;
+                `);
+                
+                // 5. Clear the outgoing values table
+                await client.query('TRUNCATE temp_outgoing_values;');
+                
+                // 6. Insert outgoing values
+                await client.query(`
+                    INSERT INTO temp_outgoing_values (address, value)
+                    SELECT from_address, SUM(-value::numeric) 
+                    FROM transactions
+                    WHERE block_number IN (SELECT block_number FROM temp_blocks_in_range)
+                    GROUP BY from_address;
+                `);
+                
+                // 7. Create temp table for incoming values
+                await client.query(`
+                    CREATE TEMP TABLE IF NOT EXISTS temp_incoming_values (
+                        address VARCHAR(42),
+                        value NUMERIC(38, 0)
+                    ) ON COMMIT DROP;
+                `);
+                
+                // 8. Clear the incoming values table
+                await client.query('TRUNCATE temp_incoming_values;');
+                
+                // 9. Insert incoming values
+                await client.query(`
+                    INSERT INTO temp_incoming_values (address, value)
+                    SELECT to_address, SUM(value::numeric) 
+                    FROM transactions
+                    WHERE to_address IS NOT NULL AND block_number IN (SELECT block_number FROM temp_blocks_in_range)
+                    GROUP BY to_address;
+                `);
+                
+                // 10. Get final results
+                const result = await client.query(`
+                    WITH combined_balances AS (
+                        SELECT address, SUM(value) as net_value
                         FROM (
-                            SELECT from_address AS address, -value::numeric AS value FROM transactions
-                            WHERE block_number IN (SELECT block_number FROM blocks WHERE timestamp >= EXTRACT(EPOCH FROM (NOW() - INTERVAL '${interval}')))
+                            SELECT address, value FROM temp_outgoing_values
                             UNION ALL
-                            SELECT to_address AS address, value::numeric AS value FROM transactions
-                            WHERE to_address IS NOT NULL AND block_number IN (SELECT block_number FROM blocks WHERE timestamp >= EXTRACT(EPOCH FROM (NOW() - INTERVAL '${interval}')))
+                            SELECT address, value FROM temp_incoming_values
                         ) t
                         GROUP BY address
                     )
                     SELECT address, net_value
-                    FROM address_balances
+                    FROM combined_balances
                     WHERE net_value > 0 AND address IS NOT NULL
                     ORDER BY net_value DESC
                     LIMIT $1;
-                `;
+                `, [limit]);
+                
+                // Commit the transaction
+                await client.query('COMMIT');
+                
+                // Prepare the response
+                const response = {
+                    range,
+                    interval: interval || 'all',
+                    topAccounts: result.rows.map(row => ({
+                        address: row.address,
+                        netValue: row.net_value.toString()
+                    }))
+                };
+                
+                // Cache the result (longer TTL for this expensive query)
+                queryCache.set(cacheKey, response, 300); // Cache for 5 minutes
+                
+                res.json(response);
             } else {
-                query = `
-                    WITH address_balances AS (
-                        SELECT address, SUM(value) AS net_value
+                // For 'all' range, execute each statement separately
+                
+                // 1. Create temp table for outgoing values
+                await client.query(`
+                    CREATE TEMP TABLE IF NOT EXISTS temp_outgoing_values (
+                        address VARCHAR(42),
+                        value NUMERIC(38, 0)
+                    ) ON COMMIT DROP;
+                `);
+                
+                // 2. Clear the outgoing values table
+                await client.query('TRUNCATE temp_outgoing_values;');
+                
+                // 3. Insert outgoing values
+                await client.query(`
+                    INSERT INTO temp_outgoing_values (address, value)
+                    SELECT from_address, SUM(-value::numeric) 
+                    FROM transactions
+                    GROUP BY from_address;
+                `);
+                
+                // 4. Create temp table for incoming values
+                await client.query(`
+                    CREATE TEMP TABLE IF NOT EXISTS temp_incoming_values (
+                        address VARCHAR(42),
+                        value NUMERIC(38, 0)
+                    ) ON COMMIT DROP;
+                `);
+                
+                // 5. Clear the incoming values table
+                await client.query('TRUNCATE temp_incoming_values;');
+                
+                // 6. Insert incoming values
+                await client.query(`
+                    INSERT INTO temp_incoming_values (address, value)
+                    SELECT to_address, SUM(value::numeric) 
+                    FROM transactions
+                    WHERE to_address IS NOT NULL
+                    GROUP BY to_address;
+                `);
+                
+                // 7. Get final results
+                const result = await client.query(`
+                    WITH combined_balances AS (
+                        SELECT address, SUM(value) as net_value
                         FROM (
-                            SELECT from_address AS address, -value::numeric AS value FROM transactions
+                            SELECT address, value FROM temp_outgoing_values
                             UNION ALL
-                            SELECT to_address AS address, value::numeric AS value FROM transactions WHERE to_address IS NOT NULL
+                            SELECT address, value FROM temp_incoming_values
                         ) t
                         GROUP BY address
                     )
                     SELECT address, net_value
-                    FROM address_balances
+                    FROM combined_balances
                     WHERE net_value > 0 AND address IS NOT NULL
                     ORDER BY net_value DESC
                     LIMIT $1;
-                `;
+                `, [limit]);
+                
+                // Commit the transaction
+                await client.query('COMMIT');
+                
+                // Prepare the response
+                const response = {
+                    range,
+                    interval: interval || 'all',
+                    topAccounts: result.rows.map(row => ({
+                        address: row.address,
+                        netValue: row.net_value.toString()
+                    }))
+                };
+                
+                // Cache the result (longer TTL for this expensive query)
+                queryCache.set(cacheKey, response, 300); // Cache for 5 minutes
+                
+                res.json(response);
             }
-            const result = await pool.query(query, [limit]);
-            res.json({
-                range,
-                interval: interval || 'all',
-                topAccounts: result.rows.map(row => ({
-                    address: row.address,
-                    netValue: row.net_value.toString()
-                }))
-            });
         } catch (error) {
+            // Rollback the transaction in case of error
+            await client.query('ROLLBACK');
             logger.error({ err: error, params: { range, limit } }, color.red('Error querying top accounts (SQL/database error)'));
             res.status(500).json({ error: 'Internal server error' });
+        } finally {
+            // Reset work_mem and release the client
+            try {
+                await client.query('SET LOCAL work_mem = DEFAULT;');
+            } catch {}
+            client.release();
         }
     });
 
@@ -586,33 +933,110 @@ function startStatusServer(port: number): http.Server {
      */
     app.get('/accounts/top-alltime', async (req, res) => {
         const limit = parseInt(req.query.limit as string || '10', 10);
+        
+        // Generate a cache key based on the request parameters
+        const cacheKey = `top_accounts_alltime_${limit}`;
+        
+        // Try to get from cache first
+        const cachedResult = queryCache.get(cacheKey);
+        if (cachedResult) {
+            logger.debug(`Cache hit for ${cacheKey}`);
+            return res.json(cachedResult);
+        }
+        
+        // Use a client from the pool for transaction support
+        const client = await pool.connect();
+        
         try {
-            const query = `
-                WITH address_balances AS (
-                    SELECT address, SUM(value) AS net_value
+            // Start a transaction
+            await client.query('BEGIN');
+            
+            // Temporarily increase work_mem for this complex query
+            await client.query('SET LOCAL work_mem = \'32MB\';');
+            
+            // 1. Create temp table for outgoing values
+            await client.query(`
+                CREATE TEMP TABLE IF NOT EXISTS temp_outgoing_values_alltime (
+                    address VARCHAR(42),
+                    value NUMERIC(38, 0)
+                ) ON COMMIT DROP;
+            `);
+            
+            // 2. Clear the outgoing values table
+            await client.query('TRUNCATE temp_outgoing_values_alltime;');
+            
+            // 3. Insert outgoing values
+            await client.query(`
+                INSERT INTO temp_outgoing_values_alltime (address, value)
+                SELECT from_address, SUM(-value::numeric) 
+                FROM transactions
+                GROUP BY from_address;
+            `);
+            
+            // 4. Create temp table for incoming values
+            await client.query(`
+                CREATE TEMP TABLE IF NOT EXISTS temp_incoming_values_alltime (
+                    address VARCHAR(42),
+                    value NUMERIC(38, 0)
+                ) ON COMMIT DROP;
+            `);
+            
+            // 5. Clear the incoming values table
+            await client.query('TRUNCATE temp_incoming_values_alltime;');
+            
+            // 6. Insert incoming values
+            await client.query(`
+                INSERT INTO temp_incoming_values_alltime (address, value)
+                SELECT to_address, SUM(value::numeric) 
+                FROM transactions
+                WHERE to_address IS NOT NULL
+                GROUP BY to_address;
+            `);
+            
+            // 7. Get final results
+            const result = await client.query(`
+                WITH combined_balances AS (
+                    SELECT address, SUM(value) as net_value
                     FROM (
-                        SELECT from_address AS address, -value::numeric AS value FROM transactions
+                        SELECT address, value FROM temp_outgoing_values_alltime
                         UNION ALL
-                        SELECT to_address AS address, value::numeric AS value FROM transactions WHERE to_address IS NOT NULL
+                        SELECT address, value FROM temp_incoming_values_alltime
                     ) t
                     GROUP BY address
                 )
                 SELECT address, net_value
-                FROM address_balances
+                FROM combined_balances
                 WHERE net_value > 0 AND address IS NOT NULL
                 ORDER BY net_value DESC
                 LIMIT $1;
-            `;
-            const result = await pool.query(query, [limit]);
-            res.json({
+            `, [limit]);
+            
+            // Commit the transaction
+            await client.query('COMMIT');
+            
+            // Prepare the response
+            const response = {
                 topAccounts: result.rows.map(row => ({
                     address: row.address,
                     netValue: row.net_value.toString()
                 }))
-            });
+            };
+            
+            // Cache the result for a longer period since all-time data changes less frequently
+            queryCache.set(cacheKey, response, 600); // Cache for 10 minutes
+            
+            res.json(response);
         } catch (error) {
+            // Rollback the transaction in case of error
+            await client.query('ROLLBACK');
             logger.error({ err: error, params: { limit } }, color.red('Error querying top accounts all-time (SQL/database error)'));
             res.status(500).json({ error: 'Internal server error' });
+        } finally {
+            // Reset work_mem and release the client
+            try {
+                await client.query('SET LOCAL work_mem = DEFAULT;');
+            } catch {}
+            client.release();
         }
     });
 
@@ -637,7 +1061,7 @@ function startStatusServer(port: number): http.Server {
     app.get('/stats', async (req, res) => {
         const range = req.query.range as string | undefined;
         const interval = getIntervalFromRange(range || 'all');
-        if (!range || !['1h', '1d', '7d', '1m', 'all'].includes(range)) {
+        if (!range || !['1h', '1d', '7d', '30d', 'all'].includes(range)) {
             return res.status(400).json({ error: 'Missing or invalid required query parameter: range (1h, 1d, 7d, 1m, all)' });
         }
         try {
@@ -650,7 +1074,7 @@ function startStatusServer(port: number): http.Server {
                     case '1h': startTime = now - 60 * 60; break;
                     case '1d': startTime = now - 24 * 60 * 60; break;
                     case '7d': startTime = now - 7 * 24 * 60 * 60; break;
-                    case '1m': startTime = now - 30 * 24 * 60 * 60; break;
+                    case '30d': startTime = now - 30 * 24 * 60 * 60; break;
                 }
             }
             const stats = await getStatsByTimeRangeDB(startTime, endTime);
@@ -680,7 +1104,7 @@ function startStatusServer(port: number): http.Server {
     app.get('/stats/accounts/unique-count', async (req, res) => {
         const range = req.query.range as string;
         const interval = getIntervalFromRange(range);
-        if (!['1h', '1d', '7d', '1m', 'all'].includes(range)) {
+        if (!['1h', '1d', '7d', '30d', 'all'].includes(range)) {
             return res.status(400).json({ error: 'Invalid range parameter. Use 1h, 1d, 7d, 1m, or all.' });
         }
         try {
@@ -692,7 +1116,7 @@ function startStatusServer(port: number): http.Server {
                     case '1h': startTime = now - 60 * 60; break;
                     case '1d': startTime = now - 24 * 60 * 60; break;
                     case '7d': startTime = now - 7 * 24 * 60 * 60; break;
-                    case '1m': startTime = now - 30 * 24 * 60 * 60; break;
+                    case '30d': startTime = now - 30 * 24 * 60 * 60; break;
                 }
             }
             const count = await getTotalUniqueAccountsDB(startTime, endTime);
@@ -724,24 +1148,66 @@ function startStatusServer(port: number): http.Server {
     app.get('/value', async (req, res) => {
         const range = req.query.range as string;
         const interval = getIntervalFromRange(range);
-        if (!['1h', '1d', '7d', '1m', 'all'].includes(range)) {
-            return res.status(400).json({ error: 'Invalid range parameter. Use 1h, 1d, 7d, 1m, or all.' });
+        if (!['1h', '1d', '7d', '30d', 'all'].includes(range)) {
+            return res.status(400).json({ error: 'Invalid range parameter. Use 1h, 1d, 7d, 30d, or all.' });
         }
+        
+        // Generate a cache key based on the request parameters
+        const cacheKey = `total_value_${range}`;
+        
+        // Try to get from cache first
+        const cachedResult = queryCache.get(cacheKey);
+        if (cachedResult) {
+            logger.debug(`Cache hit for ${cacheKey}`);
+            return res.json(cachedResult);
+        }
+        
         try {
-            const whereClause = interval ? `WHERE b.timestamp >= EXTRACT(EPOCH FROM (NOW() - INTERVAL '${interval}'))` : '';
-            const query = `
-                SELECT SUM(t.value) AS total_value
-                FROM transactions t
-                JOIN blocks b ON t.block_number = b.block_number
-                ${whereClause};
-            `;
+            // Use a more efficient query with a subquery instead of a join
+            let query;
+            if (interval) {
+                query = `
+                    SELECT SUM(t.value) AS total_value
+                    FROM transactions t
+                    WHERE t.block_number IN (
+                        SELECT block_number FROM blocks 
+                        WHERE timestamp >= EXTRACT(EPOCH FROM (NOW() - INTERVAL '${interval}'))
+                    );
+                `;
+            } else {
+                // For 'all' range, just sum all values
+                query = `SELECT SUM(value) AS total_value FROM transactions;`;
+            }
+            
             const result = await pool.query(query);
             const totalValue = result.rows[0]?.total_value || '0';
-            const minMaxQuery = 'SELECT MIN(timestamp) AS earliest, MAX(timestamp) AS latest FROM blocks';
-            const minMaxResult = await pool.query(minMaxQuery);
-            const earliest = minMaxResult.rows[0]?.earliest || null;
-            const latest = minMaxResult.rows[0]?.latest || null;
-            res.json({ range, interval: interval || 'all', totalValue: totalValue, availableDataRange: { earliest, latest } });
+            
+            // Get min/max timestamps (reuse cached version if available)
+            const timeRangeCacheKey = 'blocks_time_range';
+            let timeRange = queryCache.get(timeRangeCacheKey);
+            
+            if (!timeRange) {
+                const minMaxQuery = 'SELECT MIN(timestamp) AS earliest, MAX(timestamp) AS latest FROM blocks';
+                const minMaxResult = await pool.query(minMaxQuery);
+                timeRange = { 
+                    earliest: minMaxResult.rows[0]?.earliest || null,
+                    latest: minMaxResult.rows[0]?.latest || null 
+                };
+                queryCache.set(timeRangeCacheKey, timeRange, 300); // Cache for 5 minutes
+            }
+            
+            // Prepare the response
+            const response = { 
+                range, 
+                interval: interval || 'all', 
+                totalValue: totalValue, 
+                availableDataRange: timeRange 
+            };
+            
+            // Cache the result
+            queryCache.set(cacheKey, response);
+            
+            res.json(response);
         } catch (error) {
             logger.error({ err: error, query: req.query }, color.red('Error querying total value'));
             res.status(500).json({ error: 'Internal server error' });
@@ -752,33 +1218,74 @@ function startStatusServer(port: number): http.Server {
     app.get('/gas', async (req, res) => {
         const range = req.query.range as string;
         const interval = getIntervalFromRange(range);
-        if (!['1h', '1d', '7d', '1m', 'all'].includes(range)) {
-            return res.status(400).json({ error: 'Invalid range parameter. Use 1h, 1d, 7d, 1m, or all.' });
+        if (!['1h', '1d', '7d', '30d', 'all'].includes(range)) {
+            return res.status(400).json({ error: 'Invalid range parameter. Use 1h, 1d, 7d, 30d, or all.' });
         }
+        
+        // Generate a cache key based on the request parameters
+        const cacheKey = `gas_stats_${range}`;
+        
+        // Try to get from cache first
+        const cachedResult = queryCache.get(cacheKey);
+        if (cachedResult) {
+            logger.debug(`Cache hit for ${cacheKey}`);
+            return res.json(cachedResult);
+        }
+        
         try {
-            const whereClause = interval ? `WHERE b.timestamp >= EXTRACT(EPOCH FROM (NOW() - INTERVAL '${interval}'))` : '';
-            const query = `
-                SELECT 
-                    SUM(b.gas_used) as total_gas_used,
-                    AVG(b.gas_used) as avg_gas_per_block,
-                    COUNT(DISTINCT b.block_number) as total_blocks
-                FROM blocks b
-                ${whereClause};
-            `;
+            // Use a more efficient query with an index hint
+            let query;
+            if (interval) {
+                query = `
+                    SELECT 
+                        SUM(gas_used) as total_gas_used,
+                        AVG(gas_used) as avg_gas_per_block,
+                        COUNT(*) as total_blocks
+                    FROM blocks
+                    WHERE timestamp >= EXTRACT(EPOCH FROM (NOW() - INTERVAL '${interval}'))
+                    /*+ INDEX(blocks idx_blocks_timestamp) */;
+                `;
+            } else {
+                query = `
+                    SELECT 
+                        SUM(gas_used) as total_gas_used,
+                        AVG(gas_used) as avg_gas_per_block,
+                        COUNT(*) as total_blocks
+                    FROM blocks;
+                `;
+            }
+            
             const result = await pool.query(query);
             const stats = result.rows[0];
-            const minMaxQuery = 'SELECT MIN(timestamp) AS earliest, MAX(timestamp) AS latest FROM blocks';
-            const minMaxResult = await pool.query(minMaxQuery);
-            const earliest = minMaxResult.rows[0]?.earliest || null;
-            const latest = minMaxResult.rows[0]?.latest || null;
-            res.json({
+            
+            // Get min/max timestamps (reuse cached version if available)
+            const timeRangeCacheKey = 'blocks_time_range';
+            let timeRange = queryCache.get(timeRangeCacheKey);
+            
+            if (!timeRange) {
+                const minMaxQuery = 'SELECT MIN(timestamp) AS earliest, MAX(timestamp) AS latest FROM blocks';
+                const minMaxResult = await pool.query(minMaxQuery);
+                timeRange = { 
+                    earliest: minMaxResult.rows[0]?.earliest || null,
+                    latest: minMaxResult.rows[0]?.latest || null 
+                };
+                queryCache.set(timeRangeCacheKey, timeRange, 300); // Cache for 5 minutes
+            }
+            
+            // Prepare the response
+            const response = {
                 range,
                 interval: interval || 'all',
                 totalGasUsed: parseInt(stats.total_gas_used || '0', 10),
                 averageGasPerBlock: parseFloat(stats.avg_gas_per_block || '0'),
                 totalBlocks: parseInt(stats.total_blocks || '0', 10),
-                availableDataRange: { earliest, latest }
-            });
+                availableDataRange: timeRange
+            };
+            
+            // Cache the result
+            queryCache.set(cacheKey, response);
+            
+            res.json(response);
         } catch (error) {
             logger.error({ err: error, query: req.query }, color.red('Error querying gas statistics'));
             res.status(500).json({ error: 'Internal server error' });

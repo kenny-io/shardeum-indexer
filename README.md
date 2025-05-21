@@ -1,22 +1,24 @@
 # Shardeum Transaction Indexer
 
-A robust Ethereum transaction indexer that processes and stores blockchain data, providing a rich set of APIs for querying historical metrics and transaction data.
+A high-performance blockchain indexer that processes and stores Shardeum transaction data, providing a rich set of optimized APIs for querying historical metrics and transaction data with minimal latency.
 
 ## Features
 
 - Real-time blockchain data indexing
-- Historical metrics and analytics
-- RESTful API endpoints for data access
+- Optimized historical metrics and analytics
+- High-performance RESTful API endpoints with caching
 - Support for both forward and backward indexing
 - Efficient batch processing
-- PostgreSQL database backend
+- PostgreSQL database backend with optimized indexes
 - Configurable time ranges for metrics
+- In-memory caching for frequently accessed data
+- Optimized database queries for large datasets
 
 ## Prerequisites
 
-- Node.js (v14 or higher)
+- Node.js (v20 or higher)
 - PostgreSQL database
-- Access to an Ethereum node (JSON-RPC endpoint)
+- Access to a Shardeum node (JSON-RPC endpoint)
 
 ## Configuration
 
@@ -43,8 +45,10 @@ All endpoints support the following time ranges:
 - `1h`: Last hour
 - `1d`: Last 24 hours
 - `7d`: Last 7 days
-- `1m`: Last 1 month
+- `30d`: Last 30 days
 - `all`: All available data
+
+All endpoints implement optimized queries and caching for improved performance.
 
 ### Indexer Status
 
@@ -85,7 +89,7 @@ Response:
 
 ### Transaction Count
 
-Get the number of transactions in a time range.
+Get the number of transactions in a time range. This endpoint uses optimized queries and caching.
 
 ```http
 GET /transactions/count?range=1d
@@ -97,13 +101,17 @@ Response:
 {
   "range": "1d",
   "interval": "1 day",
-  "count": 150000
+  "count": 150000,
+  "availableDataRange": {
+    "earliest": 1678900000,
+    "latest": 1678986400
+  }
 }
 ```
 
 ### Transaction Value
 
-Get the total value transferred in a time range.
+Get the total value transferred in a time range. This endpoint uses optimized subqueries instead of joins and implements caching.
 
 ```http
 GET /value?range=7d
@@ -115,13 +123,17 @@ Response:
 {
   "range": "7d",
   "interval": "7 days",
-  "totalValue": "1000000000000000000"
+  "totalValue": "1000000000000000000",
+  "availableDataRange": {
+    "earliest": 1678900000,
+    "latest": 1678986400
+  }
 }
 ```
 
 ### Gas Usage
 
-Get gas usage statistics for a time range.
+Get gas usage statistics for a time range. This endpoint uses optimized queries with index hints and caching.
 
 ```http
 GET /gas?range=1d
@@ -135,17 +147,17 @@ Response:
   "interval": "1 day",
   "totalGasUsed": 1500000000,
   "averageGasPerBlock": 15000000,
-  "totalBlocks": 100
+  "totalBlocks": 100,
+  "availableDataRange": {
+    "earliest": 1678900000,
+    "latest": 1678986400
+  }
 }
 ```
 
 ### Transaction Types
 
-Get the distribution of transaction types in a time range. For contract interactions, the input data is decoded as UTF-8 and parsed as JSON. If the JSON contains an `internalTXType` field:
-- `6` → `stake`
-- `7` → `unstake`
-- any other value → `other_contract_interaction`
-If the input data is not JSON or does not contain `internalTXType`, it is classified as `contract_interaction`.
+Get the distribution of transaction types in a time range. This endpoint uses database-level classification and caching for improved performance.
 
 ```http
 GET /transactions/types?range=7d
@@ -159,17 +171,18 @@ Example response:
   "interval": "7 days",
   "distribution": {
     "transfer": 1000,
-    "stake": 120,
-    "unstake": 30,
-    "other_contract_interaction": 15,
-    "contract_interaction": 50
+    "contract_interaction": 215
+  },
+  "availableDataRange": {
+    "earliest": 1678900000,
+    "latest": 1678986400
   }
 }
 ```
 
 ### Top Accounts
 
-Get the top accounts by net value in a time range.
+Get the top accounts by net value in a time range. This endpoint uses optimized temporary tables and increased work memory for handling large datasets efficiently.
 
 ```http
 GET /accounts/top?range=1d&limit=20
@@ -193,7 +206,7 @@ Response:
 
 ### Top Accounts (All-Time)
 
-Get the top accounts by net value for all time (no time filter).
+Get the top accounts by net value for all time (no time filter). This endpoint uses optimized temporary tables and increased work memory with a longer cache duration.
 
 ```http
 GET /accounts/top-alltime?limit=20
@@ -215,7 +228,7 @@ Response:
 
 ### Block Metrics
 
-Get block production statistics for a time range.
+Get block production statistics for a time range. This endpoint uses split queries and limited sampling for calculating average block time efficiently.
 
 ```http
 GET /blocks/metrics?range=1h

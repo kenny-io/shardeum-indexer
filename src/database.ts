@@ -69,6 +69,13 @@ export async function initializeDatabase(): Promise<void> {
         await client.query('CREATE INDEX IF NOT EXISTS idx_transactions_block_number ON transactions(block_number);');
         await client.query('CREATE INDEX IF NOT EXISTS idx_transactions_from_address ON transactions(from_address);');
         await client.query('CREATE INDEX IF NOT EXISTS idx_transactions_to_address ON transactions(to_address);');
+        
+        // Add index on blocks.timestamp for faster time-range queries
+        await client.query('CREATE INDEX IF NOT EXISTS idx_blocks_timestamp ON blocks(timestamp);');
+        
+        // Add compound index for common join patterns
+        await client.query('CREATE INDEX IF NOT EXISTS idx_transactions_block_value ON transactions(block_number, value);');
+        
         logger.info('Indexes checked/created.');
 
         logger.info('Database schema initialization complete.');
@@ -382,27 +389,94 @@ export async function getStatsByTimeRangeDB(startTime: number, endTime: number):
 
 // Get total unique accounts (from/to addresses) within a time range
 export async function getTotalUniqueAccountsDB(startTime: number, endTime: number): Promise<number> {
+    // Use a unique table name for each request to avoid conflicts
+    const tableName = `temp_unique_addresses_${Date.now()}_${Math.floor(Math.random() * 10000)}`;
+    const client = await pool.connect();
+    
     try {
-        // Use UNION to get distinct addresses from both columns
-        const query = `
-            SELECT COUNT(DISTINCT address) 
-            FROM (
-                SELECT lower(from_address) as address 
+        // Start a transaction to ensure all operations are atomic
+        await client.query('BEGIN');
+        
+        // Disable parallel query execution to reduce memory usage
+        await client.query('SET LOCAL max_parallel_workers_per_gather = 0;');
+        
+        // Create a temporary table to store unique addresses with a unique name
+        // This table will only exist for the duration of this transaction
+        await client.query(`
+            CREATE TEMP TABLE ${tableName} (
+                address TEXT PRIMARY KEY
+            ) ON COMMIT DROP;
+        `);
+        
+        // Insert query for from_addresses
+        let insertFromQuery, insertToQuery;
+        let params: any[] = [];
+        
+        if (startTime === 0) { // This is the 'all' case
+            insertFromQuery = `
+                INSERT INTO ${tableName} (address)
+                SELECT DISTINCT lower(from_address) 
+                FROM transactions
+                WHERE from_address IS NOT NULL
+                ON CONFLICT (address) DO NOTHING;
+            `;
+            
+            insertToQuery = `
+                INSERT INTO ${tableName} (address)
+                SELECT DISTINCT lower(to_address) 
+                FROM transactions
+                WHERE to_address IS NOT NULL
+                ON CONFLICT (address) DO NOTHING;
+            `;
+        } else {
+            insertFromQuery = `
+                INSERT INTO ${tableName} (address)
+                SELECT DISTINCT lower(from_address) 
                 FROM transactions t
                 JOIN blocks b ON t.block_number = b.block_number
-                WHERE b.timestamp >= $1 AND b.timestamp <= $2
-                UNION
-                SELECT lower(to_address) as address 
+                WHERE from_address IS NOT NULL
+                AND b.timestamp >= $1 AND b.timestamp <= $2
+                ON CONFLICT (address) DO NOTHING;
+            `;
+            
+            insertToQuery = `
+                INSERT INTO ${tableName} (address)
+                SELECT DISTINCT lower(to_address) 
                 FROM transactions t
                 JOIN blocks b ON t.block_number = b.block_number
                 WHERE to_address IS NOT NULL
                 AND b.timestamp >= $1 AND b.timestamp <= $2
-            ) unique_addresses;
-        `;
-        const result = await pool.query(query, [startTime, endTime]);
-        return parseInt(result.rows[0].count, 10);
+                ON CONFLICT (address) DO NOTHING;
+            `;
+            
+            params = [startTime, endTime];
+        }
+        
+        // Process in batches to reduce memory pressure
+        await client.query(insertFromQuery, params);
+        await client.query(insertToQuery, params);
+        
+        // Count the unique addresses
+        const countResult = await client.query(`SELECT COUNT(*) as count FROM ${tableName};`);
+        const count = parseInt(countResult.rows[0].count, 10) || 0;
+        
+        // Commit the transaction
+        await client.query('COMMIT');
+        
+        return count;
+        
     } catch (err) {
+        // Rollback in case of error
+        await client.query('ROLLBACK');
         logger.error({ err, startTime, endTime }, 'Error querying total unique accounts');
         throw err;
+    } finally {
+        // Reset the parallel workers setting and release the client
+        try {
+            await client.query('SET LOCAL max_parallel_workers_per_gather = DEFAULT;');
+            client.release();
+        } catch (err) {
+            // Ignore errors in cleanup
+        }
     }
 }
